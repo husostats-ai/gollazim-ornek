@@ -1,0 +1,85 @@
+# Örnek sayfanın (gollazim-ornek) GitHub Pages yayını ve OTOMATİK KAPANIŞI.
+# Bu dosya gollazim-site reposundaki scripts/ornek/sayfa.yml'den kopyalanır; burada düzenlemeyin.
+#
+# Dallar: main = derlenmiş sayfa (veri YOK) + bu iş akışı; veri = yalnızca ornek.json (geçmişsiz tek commit).
+#   workflow_dispatch : yayın komutu (npm run ornek-yayinla) her yayından sonra başlatır.
+#   schedule          : 08:00–09:55 (Türkiye) arasında 5 dakikada bir, ayrıca saatte bir yedek. Süresi
+#                       dolmuş veri varsa veri dalını "kapalı" dosyayla SIFIRDAN yazar ve sayfayı yeniden yayınlar.
+# Her çalıştırma sonunda bu repodaki bütün Actions yapıtları (artifact) silinir: eski günün verisi kalmaz.
+
+name: Örnek sayfa
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 5-6 * * *'
+    - cron: '41 * * * *'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  actions: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  sayfa:
+    runs-on: ubuntu-26.04
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: site
+      - name: Veri ve süre
+        id: durum
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          cd site
+          rm -rf .github
+          if git fetch --quiet --depth=1 origin veri && git show FETCH_HEAD:ornek.json > ornek.json 2>/dev/null; then :; else echo '{"v":1,"closed":true}' > ornek.json; fi
+          node -e '
+            const fs = require("fs")
+            const d = JSON.parse(fs.readFileSync("ornek.json", "utf8"))
+            const now = Date.now()
+            let action
+            if (d.closed === true) action = process.env.EVENT === "schedule" ? "none" : "deploy"
+            else if (now >= Date.parse(d.closesAt)) action = "close"
+            else if (now < Date.parse(d.opensAt)) action = "early"
+            else action = process.env.EVENT === "schedule" ? "none" : "deploy"
+            if (action === "close" || action === "early") fs.writeFileSync("ornek.json", JSON.stringify({ v: 1, closed: true }) + "\n")
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `action=${action}\n`)
+            console.log(`karar: ${action}`)
+          '
+      - name: Süresi dolan veriyi repodan kaldır (veri dalı sıfırdan)
+        if: steps.durum.outputs.action == 'close'
+        run: |
+          mkdir kapali && cd kapali
+          cp ../site/ornek.json .
+          git init -q
+          git checkout -q -b veri
+          git add ornek.json
+          git -c user.name='GOLLAZIM yayın' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -q -m 'Süre doldu'
+          git push --force --quiet "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" veri:veri
+      - uses: actions/configure-pages@v6
+        if: steps.durum.outputs.action != 'none'
+      - uses: actions/upload-pages-artifact@v5
+        if: steps.durum.outputs.action != 'none'
+        with:
+          path: site
+          retention-days: 1
+      - id: deployment
+        if: steps.durum.outputs.action != 'none'
+        uses: actions/deploy-pages@v5
+      - name: Yapıtları sil
+        if: always() && steps.durum.outputs.action != 'none'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for id in $(gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" -q '.artifacts[].id'); do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+          done
